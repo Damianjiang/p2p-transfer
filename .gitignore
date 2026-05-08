@@ -1,0 +1,14 @@
+# Compiled binary
+p2p_transfer
+*.o
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Received files
+received_*
