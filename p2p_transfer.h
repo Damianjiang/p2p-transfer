@@ -36,6 +36,7 @@
 #define MSG_TYPE_TEXT 8
 #define MSG_TYPE_DISCOVER 9
 #define MSG_TYPE_DISCOVER_ACK 10
+#define MSG_TYPE_AUTH_RESPONSE 11
 
 typedef struct {
     int magic;
@@ -50,6 +51,13 @@ typedef struct {
     char password[MAX_PASSWORD];
     char username[64];
 } AuthMessage;
+
+typedef struct {
+    int magic;
+    int type;
+    int success;
+    char message[64];
+} AuthResponseMessage;
 
 typedef struct {
     int magic;

@@ -200,6 +200,57 @@ int recv_message(int sock, int *type, void **data) {
 
 int handle_message(int type, void *data, int len) {
     switch (type) {
+        case MSG_TYPE_AUTH: {
+            AuthMessage *auth = (AuthMessage *)data;
+            printf("\033[1;33m[*] Authentication request from: %s\033[0m\n", auth->username);
+            
+            if (verify_password(auth->password)) {
+                printf("\033[1;32m[+] Password correct, accepting connection\033[0m\n");
+                AuthResponseMessage resp;
+                memset(&resp, 0, sizeof(resp));
+                resp.magic = htonl(HANDSHAKE_MAGIC);
+                resp.type = htonl(MSG_TYPE_AUTH_RESPONSE);
+                resp.success = htonl(1);
+                strncpy(resp.message, "Welcome!", 63);
+                send_message(g_socket, MSG_TYPE_AUTH_RESPONSE, &resp, sizeof(resp));
+            } else {
+                printf("\033[1;31m[-] Password incorrect, rejecting connection\033[0m\n");
+                AuthResponseMessage resp;
+                memset(&resp, 0, sizeof(resp));
+                resp.magic = htonl(HANDSHAKE_MAGIC);
+                resp.type = htonl(MSG_TYPE_AUTH_RESPONSE);
+                resp.success = htonl(0);
+                strncpy(resp.message, "Invalid password", 63);
+                send_message(g_socket, MSG_TYPE_AUTH_RESPONSE, &resp, sizeof(resp));
+                close(g_socket);
+                pthread_mutex_lock(&g_mutex);
+                g_socket = -1;
+                g_connected = 0;
+                pthread_mutex_unlock(&g_mutex);
+            }
+            break;
+        }
+        
+        case MSG_TYPE_AUTH_RESPONSE: {
+            AuthResponseMessage *resp = (AuthResponseMessage *)data;
+            int success = ntohl(resp->success);
+            if (success) {
+                printf("\033[1;32m[+] Authentication successful: %s\033[0m\n", resp->message);
+                pthread_mutex_lock(&g_mutex);
+                g_connected = 1;
+                pthread_mutex_unlock(&g_mutex);
+            } else {
+                printf("\033[1;31m[-] Authentication failed: %s\033[0m\n", resp->message);
+                close(g_socket);
+                pthread_mutex_lock(&g_mutex);
+                g_socket = -1;
+                g_connected = 0;
+                pthread_mutex_unlock(&g_mutex);
+                g_running = 0;
+            }
+            break;
+        }
+        
         case MSG_TYPE_TEXT: {
             printf("\033[1;36m[Peer]: %.*s\033[0m\n", len, (char *)data);
             break;
@@ -431,6 +482,7 @@ int authenticate(int sock) {
     strncpy(auth.password, g_password, MAX_PASSWORD - 1);
     strncpy(auth.username, g_username, 63);
     
+    printf("\033[1;33m[*] Sending authentication...\033[0m\n");
     return send_message(sock, MSG_TYPE_AUTH, &auth, sizeof(auth));
 }
 
@@ -540,6 +592,82 @@ int create_listening_socket(int port) {
     return sock;
 }
 
+typedef struct {
+    int sock;
+    char ip[64];
+    int port;
+} AuthThreadArg;
+
+void *server_auth_thread(void *arg) {
+    AuthThreadArg *auth_arg = (AuthThreadArg *)arg;
+    int sock = auth_arg->sock;
+    char *client_ip = auth_arg->ip;
+    int client_port = auth_arg->port;
+    
+    printf("\033[1;33m[*] Waiting for authentication from %s:%d...\033[0m\n", client_ip, client_port);
+    
+    int type;
+    void *data = NULL;
+    int len = recv_message(sock, &type, &data);
+    
+    if (len < 0 || type != MSG_TYPE_AUTH) {
+        printf("\033[1;31m[-] Authentication failed or timeout\033[0m\n");
+        close(sock);
+        free(auth_arg);
+        return NULL;
+    }
+    
+    AuthMessage *auth = (AuthMessage *)data;
+    printf("\033[1;33m[*] Authentication request from: %s\033[0m\n", auth->username);
+    
+    if (verify_password(auth->password)) {
+        printf("\033[1;32m[+] Password correct, accepting connection\033[0m\n");
+        
+        AuthResponseMessage resp;
+        memset(&resp, 0, sizeof(resp));
+        resp.magic = htonl(HANDSHAKE_MAGIC);
+        resp.type = htonl(MSG_TYPE_AUTH_RESPONSE);
+        resp.success = htonl(1);
+        strncpy(resp.message, "Welcome!", 63);
+        send_message(sock, MSG_TYPE_AUTH_RESPONSE, &resp, sizeof(resp));
+        
+        free(data);
+        
+        pthread_mutex_lock(&g_mutex);
+        if (g_connected) {
+            printf("\033[1;33m[!] Already connected, rejecting new connection\033[0m\n");
+            close(sock);
+        } else {
+            g_socket = sock;
+            g_connected = 1;
+            strncpy(g_remote_ip, client_ip, 63);
+            g_remote_port = client_port;
+            
+            pthread_t *recv_t = malloc(sizeof(pthread_t));
+            int *sock_arg = malloc(sizeof(int));
+            *sock_arg = sock;
+            pthread_create(recv_t, NULL, receive_thread, sock_arg);
+        }
+        pthread_mutex_unlock(&g_mutex);
+    } else {
+        printf("\033[1;31m[-] Password incorrect, rejecting connection\033[0m\n");
+        
+        AuthResponseMessage resp;
+        memset(&resp, 0, sizeof(resp));
+        resp.magic = htonl(HANDSHAKE_MAGIC);
+        resp.type = htonl(MSG_TYPE_AUTH_RESPONSE);
+        resp.success = htonl(0);
+        strncpy(resp.message, "Invalid password", 63);
+        send_message(sock, MSG_TYPE_AUTH_RESPONSE, &resp, sizeof(resp));
+        
+        free(data);
+        close(sock);
+    }
+    
+    free(auth_arg);
+    return NULL;
+}
+
 void *accept_thread(void *arg) {
     int listen_sock = *(int *)arg;
     free(arg);
@@ -561,27 +689,23 @@ void *accept_thread(void *arg) {
         
         printf("\033[1;32m[+] Incoming connection from %s:%d\033[0m\n", client_ip, client_port);
         
-        int *auth_result = malloc(sizeof(int));
-        *auth_result = 0;
-        
-        pthread_t auth_thread;
-        pthread_create(&auth_thread, NULL, (void *(*)(void *))authenticate, (void *)(long)client_sock);
-        pthread_detach(auth_thread);
-        
         pthread_mutex_lock(&g_mutex);
         if (g_connected) {
             printf("\033[1;33m[!] Already connected, rejecting new connection\033[0m\n");
             close(client_sock);
-        } else {
-            g_socket = client_sock;
-            g_connected = 1;
-            strncpy(g_remote_ip, client_ip, 63);
-            g_remote_port = client_port;
-            
-            pthread_t *recv_t = malloc(sizeof(pthread_t));
-            pthread_create(recv_t, NULL, receive_thread, (void *)(long)client_sock);
+            pthread_mutex_unlock(&g_mutex);
+            continue;
         }
         pthread_mutex_unlock(&g_mutex);
+        
+        AuthThreadArg *auth_arg = malloc(sizeof(AuthThreadArg));
+        auth_arg->sock = client_sock;
+        strncpy(auth_arg->ip, client_ip, 63);
+        auth_arg->port = client_port;
+        
+        pthread_t auth_thread;
+        pthread_create(&auth_thread, NULL, server_auth_thread, auth_arg);
+        pthread_detach(auth_thread);
     }
     
     return NULL;
@@ -677,11 +801,6 @@ int main(int argc, char *argv[]) {
         while (!g_connected && g_running) {
             sleep(1);
         }
-        
-        if (g_connected) {
-            pthread_t *recv_t = malloc(sizeof(pthread_t));
-            pthread_create(recv_t, NULL, receive_thread, (void *)(long)g_socket);
-        }
     }
     
     if (connect_ip) {
@@ -703,8 +822,52 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         
-        pthread_t *recv_t = malloc(sizeof(pthread_t));
-        pthread_create(recv_t, NULL, receive_thread, (void *)(long)g_socket);
+        printf("\033[1;33m[*] Waiting for authentication response...\033[0m\n");
+        
+        int auth_timeout = 0;
+        while (!g_connected && g_running && auth_timeout < 10) {
+            int type;
+            void *data = NULL;
+            int len = recv_message(g_socket, &type, &data);
+            
+            if (len < 0) {
+                fprintf(stderr, "\033[1;31m[-] Connection closed during authentication\033[0m\n");
+                close(g_socket);
+                return 1;
+            }
+            
+            if (type == MSG_TYPE_AUTH_RESPONSE && data) {
+                AuthResponseMessage *resp = (AuthResponseMessage *)data;
+                int success = ntohl(resp->success);
+                if (success) {
+                    printf("\033[1;32m[+] Authentication successful: %s\033[0m\n", resp->message);
+                    g_connected = 1;
+                    strncpy(g_remote_ip, connect_ip, 63);
+                    g_remote_port = connect_port;
+                    
+                    pthread_t *recv_t = malloc(sizeof(pthread_t));
+                    int *sock_arg = malloc(sizeof(int));
+                    *sock_arg = g_socket;
+                    pthread_create(recv_t, NULL, receive_thread, sock_arg);
+                } else {
+                    fprintf(stderr, "\033[1;31m[-] Authentication failed: %s\033[0m\n", resp->message);
+                    free(data);
+                    close(g_socket);
+                    return 1;
+                }
+                free(data);
+                break;
+            }
+            
+            auth_timeout++;
+            sleep(1);
+        }
+        
+        if (!g_connected) {
+            fprintf(stderr, "\033[1;31m[-] Authentication timeout\033[0m\n");
+            close(g_socket);
+            return 1;
+        }
     }
     
     if (listen_port == 0 && !connect_ip) {
