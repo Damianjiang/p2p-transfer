@@ -1,0 +1,11 @@
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+dist/
+build/
+*.log
+.DS_Store
+Thumbs.db
+*.o
+p2p_transfer
